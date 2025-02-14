@@ -1,7 +1,8 @@
 import os
 import logging
 from dotenv import load_dotenv
-from qdrant_operations import search_collection, search_collection_async
+from qdrant_operations import search_collection, search_collection_async, create_collection_if_not_exists
+from s3_operations import initialize_s3_client, check_do_spaces_connection
 from sentence_transformers import SentenceTransformer
 import requests
 import json
@@ -24,8 +25,11 @@ import hashlib
 from qdrant_client import QdrantClient
 from utils import get_model, get_qdrant_client
 from tenacity import retry, stop_after_attempt, wait_exponential
+from asyncio import Semaphore
+from concurrent.futures import ThreadPoolExecutor
 
-load_dotenv()
+# Force reload environment variables
+load_dotenv(override=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -215,20 +219,28 @@ def call_deepseek_api(prompt):
         }
 
 def save_to_chat_history(user_ask, respon, state):
+    """Save chat history to Digital Ocean Spaces"""
     try:
         # Try to get existing chat history from Spaces
         try:
-            response = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key='datasets/chat_history.json')
+            response = s3_client.get_object(
+                Bucket=DO_SPACES_BUCKET,
+                Key='datasets/chat_history.json'
+            )
             chat_history = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info("Successfully retrieved existing chat_history.json")
         except s3_client.exceptions.NoSuchKey:
+            logger.info("No existing chat_history.json, creating new file")
             chat_history = []
+        except Exception as e:
+            logger.error(f"Error reading chat_history.json: {str(e)}")
+            return False
 
-        # Create a new chat history entry
+        # Create a new chat history entry matching your format
         chat_history_entry = {
             "id": len(chat_history) + 1,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "user_ask": user_ask,
-            "respon": respon,
+            "user_ask": user_ask,    # Changed to match your format
+            "respon": respon,        # Changed to match your format
             "state": state
         }
 
@@ -236,51 +248,69 @@ def save_to_chat_history(user_ask, respon, state):
         chat_history.append(chat_history_entry)
 
         # Upload updated chat history back to Spaces
-        s3_client.put_object(
-            Bucket=DO_SPACES_BUCKET,
-            Key='datasets/chat_history.json',
-            Body=json.dumps(chat_history, ensure_ascii=False, indent=4).encode('utf-8'),
-            ContentType='application/json'
-        )
-    except Exception as e:
-        logger.error(f"Error saving to chat history: {e}")
-
-# Function to save feedback to train_message.json in Digital Ocean Spaces
-def save_feedback(question, ai_response, is_correct, user_correction=None):
-    feedback = {
-        "question": question,
-        "ai_response": ai_response,
-        "is_correct": is_correct,
-        "user_correction": user_correction,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    try:
-        # Try to get existing train_message.json from Spaces
         try:
-            response = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key='datasets/train_message.json')
+            s3_client.put_object(
+                Bucket=DO_SPACES_BUCKET,
+                Key='datasets/chat_history.json',
+                Body=json.dumps(chat_history, ensure_ascii=False, indent=4).encode('utf-8'),
+                ContentType='application/json'
+            )
+            logger.info("Successfully saved to chat_history.json")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving chat_history.json: {str(e)}")
+            return False
+
+    except Exception as e:
+        logger.error(f"Error in save_to_chat_history: {str(e)}")
+        return False
+
+def save_feedback(question, ai_response, is_correct, user_correction=None):
+    """Save feedback with chat history update"""
+    try:
+        # Save to train_message.json
+        feedback = {
+            "question": question,
+            "ai_response": ai_response,
+            "is_correct": is_correct,
+            "user_correction": user_correction,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        try:
+            response = s3_client.get_object(
+                Bucket=DO_SPACES_BUCKET,
+                Key='datasets/train_message.json'
+            )
             data = json.loads(response['Body'].read().decode('utf-8'))
+            logger.info("Successfully retrieved existing train_message.json")
         except s3_client.exceptions.NoSuchKey:
-            logger.info("Creating new train_message.json file")
+            logger.info("No existing train_message.json, creating new file")
             data = []
+        except Exception as e:
+            logger.error(f"Error reading train_message.json: {str(e)}")
+            return False
 
         # Append new feedback
         data.append(feedback)
 
-        # Upload updated train_message.json back to Spaces
-        s3_client.put_object(
-            Bucket=DO_SPACES_BUCKET,
-            Key='datasets/train_message.json',
-            Body=json.dumps(data, ensure_ascii=False, indent=4).encode('utf-8'),
-            ContentType='application/json'
-        )
-        logger.info("Successfully saved feedback to train_message.json in Spaces")
+        # Save updated train_message.json
+        try:
+            s3_client.put_object(
+                Bucket=DO_SPACES_BUCKET,
+                Key='datasets/train_message.json',
+                Body=json.dumps(data, ensure_ascii=False, indent=4).encode('utf-8'),
+                ContentType='application/json'
+            )
+            logger.info("Successfully saved to train_message.json")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving train_message.json: {str(e)}")
+            return False
 
     except Exception as e:
-        logger.error(f"Error saving feedback to Spaces: {e}")
-   
-    # Always set state to 1, regardless of is_correct
-    save_to_chat_history(question, ai_response if is_correct else user_correction, state=1)
+        logger.error(f"Error in save_feedback: {str(e)}")
+        return False
 
 
 async def check_user(update: Update) -> bool:
@@ -305,12 +335,14 @@ async def start(update: Update, context: CallbackContext):
     await update.message.reply_text("Hello! I'm your Thai language learning assistant. How can I help you today?")
 
 # Adjust these constants at the top of the file
-MAX_CONCURRENT_REQUESTS = 3  # Reduced to prevent overload
+MAX_CONCURRENT_REQUESTS = 3  # Adjust based on your server capacity
 REQUEST_TIMEOUT = 60.0  # Increased timeout for API requests
 PROCESS_TIMEOUT = 90.0  # Increased overall process timeout
 
 # Create a semaphore to limit concurrent requests
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+# Create a thread pool for CPU-bound tasks
+thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
 
 async def process_query_background(update: Update, query: str, context: CallbackContext):
     """Process query with improved concurrency handling"""
@@ -321,7 +353,7 @@ async def process_query_background(update: Update, query: str, context: Callback
             # Generate embedding for the query
             try:
                 query_embedding = await asyncio.get_event_loop().run_in_executor(
-                    None, get_embedding, query
+                    thread_pool, get_embedding, query
                 )
                 logger.info("Generated embedding successfully")
             except Exception as e:
@@ -386,7 +418,7 @@ async def process_query_background(update: Update, query: str, context: Callback
 
         except Exception as e:
             logger.error(f"Error in process_query_background: {str(e)}")
-            logger.exception("Full traceback:")  # This will log the full stack trace
+            logger.exception("Full traceback:")
             return {
                 "response": f"Sorry, there was an error processing your request: {str(e)}",
                 "input_tokens": 0,
@@ -463,112 +495,116 @@ async def call_deepseek_api_async(prompt):
             "use_cache": False,
         }
 
-def save_to_chat_history(user_ask, respon, state):
+async def handle_user_correction(update: Update, context: CallbackContext):
+    """Handle user correction and save to chat history"""
+    if "awaiting_correction" in context.user_data:
+        user_correction = update.message.text
+        correction_data = context.user_data["awaiting_correction"]
+        user_query = correction_data["user_query"]
+        ai_response = correction_data["ai_response"]
+
+        # Save the feedback with the correction
+        save_feedback(user_query, ai_response, is_correct=False, user_correction=user_correction)
+        
+        # Save the corrected answer to chat history
+        save_to_chat_history(user_query, user_correction, state=1)
+        
+        await update.message.reply_text("ကျေးဇူးတင်ပါတယ်! အဖြေမှန်ကို မှတ်သားထားလိုက်ပါပြီ။")
+
+        # Clear the correction context
+        del context.user_data["awaiting_correction"]
+    else:
+        # If not awaiting correction, treat as new query
+        await handle_message(update, context)
+
+async def handle_button_click(update: Update, context: CallbackContext):
+    """Handle button clicks with improved error handling and logging"""
     try:
-        # Try to get existing chat history from Spaces
-        try:
-            response = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key='datasets/chat_history.json')
-            chat_history = json.loads(response['Body'].read().decode('utf-8'))
-        except s3_client.exceptions.NoSuchKey:
-            chat_history = []
+        query = update.callback_query
+        logger.info(f"Received callback query: {query.data}")
+        
+        await query.answer()  # Acknowledge the button click
 
-        # Create a new chat history entry
-        chat_history_entry = {
-            "id": len(chat_history) + 1,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "user_ask": user_ask,
-            "respon": respon,
-            "state": state
-        }
+        # Get the stored context
+        last_interaction = context.user_data.get("last_interaction", {})
+        user_query = last_interaction.get("user_query")
+        ai_response = last_interaction.get("ai_response")
 
-        # Append the new entry
-        chat_history.append(chat_history_entry)
+        if not user_query or not ai_response:
+            logger.error("Missing context data in button handler")
+            await query.edit_message_text(
+                text="Error: Context missing. Please ask your question again."
+            )
+            return
 
-        # Upload updated chat history back to Spaces
-        s3_client.put_object(
-            Bucket=DO_SPACES_BUCKET,
-            Key='datasets/chat_history.json',
-            Body=json.dumps(chat_history, ensure_ascii=False, indent=4).encode('utf-8'),
-            ContentType='application/json'
-        )
-    except Exception as e:
-        logger.error(f"Error saving to chat history: {e}")
-
-# Function to save feedback to train_message.json in Digital Ocean Spaces
-def save_feedback(question, ai_response, is_correct, user_correction=None):
-    feedback = {
-        "question": question,
-        "ai_response": ai_response,
-        "is_correct": is_correct,
-        "user_correction": user_correction,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    try:
-        # Try to get existing train_message.json from Spaces
-        try:
-            response = s3_client.get_object(Bucket=DO_SPACES_BUCKET, Key='datasets/train_message.json')
-            data = json.loads(response['Body'].read().decode('utf-8'))
-        except s3_client.exceptions.NoSuchKey:
-            logger.info("Creating new train_message.json file")
-            data = []
-
-        # Append new feedback
-        data.append(feedback)
-
-        # Upload updated train_message.json back to Spaces
-        s3_client.put_object(
-            Bucket=DO_SPACES_BUCKET,
-            Key='datasets/train_message.json',
-            Body=json.dumps(data, ensure_ascii=False, indent=4).encode('utf-8'),
-            ContentType='application/json'
-        )
-        logger.info("Successfully saved feedback to train_message.json in Spaces")
+        if query.data == "correct":
+            logger.info("Processing 'correct' feedback")
+            # Save to feedback and chat history
+            save_feedback(user_query, ai_response, is_correct=True)
+            save_to_chat_history(user_query, ai_response, state=1)
+            
+            await query.edit_message_text(
+                text=f"{ai_response}\n\n✅ ကျေးဇူးတင်ပါတယ်! အဖြေမှန်ကို မှတ်သားထားလိုက်ပါပြီ။"
+            )
+        elif query.data == "incorrect":
+            logger.info("Processing 'incorrect' feedback")
+            await query.edit_message_text(
+                text=f"AI ရဲ့အဖြေက: {ai_response}\n\nအဖြေမှန်ရေးပေးပါနော်:"
+            )
+            # Store the context for correction
+            context.user_data["awaiting_correction"] = {
+                "user_query": user_query,
+                "ai_response": ai_response
+            }
+        else:
+            logger.warning(f"Unknown callback data received: {query.data}")
 
     except Exception as e:
-        logger.error(f"Error saving feedback to Spaces: {e}")
-   
-    # Always set state to 1, regardless of is_correct
-    save_to_chat_history(question, ai_response if is_correct else user_correction, state=1)
-
-
-async def check_user(update: Update) -> bool:
-    """Check if the user is allowed to use the bot"""
-    username = update.effective_user.username
-    # Remove @ symbol if present in the username
-    username = username.replace('@', '') if username else ''
-    
-    # Check if username is in the allowed users list (case-insensitive)
-    allowed = any(username.lower() == allowed_user.replace('@', '').lower() 
-                 for allowed_user in ALLOWED_USERS)
-    
-    if not allowed:
-        await update.message.reply_text("Sorry, you are not authorized to use this bot.")
-        return False
-    return True
-
-# Telegram bot handlers
-async def start(update: Update, context: CallbackContext):
-    if not await check_user(update):
-        return
-    await update.message.reply_text("Hello! I'm your Thai language learning assistant. How can I help you today?")
+        logger.error(f"Error in handle_button_click: {str(e)}")
+        logger.exception("Full traceback:")
+        try:
+            await query.edit_message_text(
+                text="Sorry, an error occurred while processing your feedback."
+            )
+        except Exception as sub_e:
+            logger.error(f"Error sending error message: {sub_e}")
 
 async def handle_message(update: Update, context: CallbackContext):
     if not await check_user(update):
         return
+
+    # Check if user typed the confirmation text
+    if update.message.text == "✅ မှန်တယ်":
+        if "last_interaction" in context.user_data:
+            last_interaction = context.user_data["last_interaction"]
+            user_query = last_interaction.get("user_query")
+            ai_response = last_interaction.get("ai_response")
+            
+            if user_query and ai_response:
+                # Save as correct feedback and to chat history
+                save_feedback(user_query, ai_response, is_correct=True)
+                save_to_chat_history(user_query, ai_response, state=1)
+                await update.message.reply_text("ကျေးဇူးတင်ပါတယ်! အဖြေမှန်ကို မှတ်သားထားလိုက်ပါပြီ။")
+                return
+            else:
+                await update.message.reply_text("ဝမ်းနည်းပါတယ်။ ပြီးခဲ့တဲ့မေးခွန်းကို ရှာမတွေ့ပါဘူး။")
+                return
 
     if "awaiting_correction" in context.user_data:
         await handle_user_correction(update, context)
         return
 
     query = update.message.text
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    logger.info(f"Received message from user {user_id}: {query}")
 
     # More informative processing message
     processing_msg = await update.message.reply_text(
         "ခဏစောင့်ပေးပါ... ကျွန်မ အဖြေရှာပေးနေပါတယ်။\n"
         "(Processing your request, please wait...)"
     )
-    context.user_data["processing_msg_id"] = processing_msg.message_id
 
     try:
         response_data = await asyncio.wait_for(
@@ -576,92 +612,45 @@ async def handle_message(update: Update, context: CallbackContext):
             timeout=PROCESS_TIMEOUT
         )
         
-        context.user_data["user_query"] = query
-        context.user_data["ai_response"] = response_data["response"]
+        # Store the context for the callback
+        context.user_data["last_interaction"] = {
+            "user_query": query,
+            "ai_response": response_data["response"]
+        }
 
+        # Create the keyboard markup
         keyboard = [
             [
-                InlineKeyboardButton("✅ မှန်တယ်", callback_data="true"),
-                InlineKeyboardButton("❌ မှားတယ်", callback_data="false")
+                InlineKeyboardButton("✅ မှန်တယ်", callback_data="correct"),
+                InlineKeyboardButton("❌ မှားတယ်", callback_data="incorrect")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        # Send the response with buttons
         await update.message.reply_text(
-            response_data["response"],
+            text=response_data["response"],
             reply_markup=reply_markup
         )
+        logger.info(f"Sent response to user {user_id}")
 
     except asyncio.TimeoutError:
         await update.message.reply_text(
-            "ဝမ်းနည်းပါတယ်။ လက်ရှိ system က နည်းနည်းနှေးနေပါတယ်။\n"
-            "ခဏလေးနေ ပြန်မေးကြည့်ပါ။\n"
-            "(Sorry, the system is a bit slow right now. Please try again in a moment.)"
+            "ဝမ်းနည်းပါတယ်။ အချိန်ကြာသွားလို့ပါ။\n"
+            "ခဏလေးနေ ပြန်မေးကြည့်ပါ။"
         )
     except Exception as e:
-        logger.error(f"Error processing message: {e}")
+        logger.error(f"Error processing message from user {user_id}: {str(e)}")
         await update.message.reply_text(
             "ဝမ်းနည်းပါတယ်။ error ဖြစ်နေပါတယ်။\n"
-            "ခဏလေးနေ ပြန်မေးကြည့်ပါ။\n"
-            "(Sorry, there was an error. Please try again.)"
+            "ခဏလေးနေ ပြန်မေးကြည့်ပါ။"
         )
     finally:
-        if "processing_msg_id" in context.user_data:
-            try:
-                await context.bot.delete_message(
-                    chat_id=update.effective_chat.id,
-                    message_id=context.user_data["processing_msg_id"]
-                )
-            except Exception as e:
-                logger.error(f"Failed to delete processing message: {e}")
-            finally:
-                del context.user_data["processing_msg_id"]
-
-async def handle_button_click(update: Update, context: CallbackContext):
-    query = update.callback_query
-    await query.answer()
-
-    # Extract data from the callback
-    data = query.data  # This will be either "true" or "false"
-
-    # Get the user query and AI response from the context
-    user_query = context.user_data.get("user_query")
-    ai_response = context.user_data.get("ai_response")
-
-    if not user_query or not ai_response:
-        await query.edit_message_text(text="Error: Missing context. Please ask your question again.")
-        return
-
-    if data == "true":
-        # Save the feedback as correct
-        save_feedback(user_query, ai_response, is_correct=True)
-        await query.edit_message_text(text="Thank you for confirming! The response has been saved as correct.")
-    elif data == "false":
-        # Prompt the user to provide the correct answer
-        await query.edit_message_text(text=f"The AI response was: {ai_response}\n\nအဖြေမှန်ရေးပေးပါနော်:")
-        # Store the context for the next message
-        context.user_data["awaiting_correction"] = {
-            "user_query": user_query,
-            "ai_response": ai_response
-        }
-
-# Handle user correction
-async def handle_user_correction(update: Update, context: CallbackContext):
-    if "awaiting_correction" in context.user_data:
-        user_correction = update.message.text
-        user_query = context.user_data["awaiting_correction"]["user_query"]
-        ai_response = context.user_data["awaiting_correction"]["ai_response"]
-
-        # Save the feedback as incorrect with the user's correction
-        save_feedback(user_query, ai_response, is_correct=False, user_correction=user_correction)
-        await update.message.reply_text("Thank you for providing the correct answer! It has been saved.")
-
-        # Clear the context
-        del context.user_data["awaiting_correction"]
-    else:
-        # If the bot is not awaiting a correction, treat the message as a new query
-        await handle_message(update, context)
-
+        # Delete processing message
+        try:
+            await processing_msg.delete()
+        except Exception as e:
+            logger.error(f"Error deleting processing message: {str(e)}")
 
 def monitor_and_upsert_chat_history(interval=3):
     """
@@ -700,15 +689,41 @@ def monitor_and_upsert_chat_history(interval=3):
         time.sleep(interval)
 
 if __name__ == "__main__":
-    # Start the Telegram bot
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Configure logging with more detail
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    # Initialize S3 client
+    s3_client = initialize_s3_client()
+    
+    # Check DO Spaces connection
+    if not s3_client or not check_do_spaces_connection(s3_client):
+        logger.error("Failed to connect to Digital Ocean Spaces. Check your credentials and connection.")
+        raise SystemExit("Cannot continue without Digital Ocean Spaces connection")
 
-    # Add handlers
+    # Check collections without recreating them
+    try:
+        create_collection_if_not_exists("knowledge_base")
+        create_collection_if_not_exists("chat_history")
+    except Exception as e:
+        logger.error(f"Error checking collections: {e}")
+
+    # Start the Telegram bot with concurrent updates
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)  # Enable concurrent updates
+        .build()
+    )
+
+    # Add handlers in the correct order
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_button_click))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(InlineQueryHandler(inline_query))
 
-    # Start the bot without the monitor thread
+    # Start the bot with all update types enabled
     logger.info("Starting bot...")
-    application.run_polling()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -20,7 +20,7 @@ PROMPT_TEMPLATES = {
 USER_PERMISSIONS = {
     "testers": [
         "blackghost000",
-        "tester1",
+        "paingchan009",
         "tester2",
         "tester3",
         "tester4",
